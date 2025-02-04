@@ -1,0 +1,7 @@
+[package]
+name = "steno-phonetics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+enumset = "1.1.5"
