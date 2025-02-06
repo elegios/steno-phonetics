@@ -1,10 +1,21 @@
 use enumset::enum_set;
-use std::collections::HashMap;
-use std::{env, fs::File, io::{self, BufRead}, process::exit};
+use std::collections::{BTreeMap, HashMap};
+use std::mem;
+use std::{
+    env,
+    fs::File,
+    io::{self, BufRead},
+    iter,
+    process::exit,
+};
+use trie_rs::{
+    inc_search::Answer,
+    map::{Trie, TrieBuilder},
+};
 
 use enumset::{EnumSet, EnumSetType};
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
 enum Sound {
     AA,
     AE,
@@ -152,7 +163,9 @@ impl WordEntry {
         if let Some(word) = iter.next() {
             return Result::Ok(WordEntry {
                 word: word.to_string(),
-                sounds: iter.map(|x| Sound::from_str(x).expect("Valid sound")).collect(),
+                sounds: iter
+                    .map(|x| Sound::from_str(x).expect("Valid sound"))
+                    .collect(),
             });
         }
         Result::Err("Empty line".to_owned())
@@ -162,7 +175,28 @@ impl WordEntry {
 #[derive(Debug, EnumSetType, PartialOrd, Ord)]
 #[enumset(repr = "u32")]
 enum StenoKey {
-    LS, LT, LK, LP, LW, LH, LR, A, O, Star, E, U, RF, RR, RP, RB, RL, RG, RT, RS, RD, RZ,
+    LS,
+    LT,
+    LK,
+    LP,
+    LW,
+    LH,
+    LR,
+    A,
+    O,
+    Star,
+    E,
+    U,
+    RF,
+    RR,
+    RP,
+    RB,
+    RL,
+    RG,
+    RT,
+    RS,
+    RD,
+    RZ,
 }
 
 fn remove_compound_sound(keys: &mut EnumSet<StenoKey>, compound: EnumSet<StenoKey>) -> bool {
@@ -175,12 +209,15 @@ fn remove_compound_sound(keys: &mut EnumSet<StenoKey>, compound: EnumSet<StenoKe
         return true;
     }
     false
-
 }
 
 fn parse_steno_chord(chord: &str) -> Option<EnumSet<StenoKey>> {
     let mut chars = chord.chars().rev().peekable();
-    fn pop_shift<T : Iterator<Item = char>>(c: char, chars: &mut std::iter::Peekable<T>, set: &mut u32) {
+    fn pop_shift<T: Iterator<Item = char>>(
+        c: char,
+        chars: &mut std::iter::Peekable<T>,
+        set: &mut u32,
+    ) {
         *set = *set << 1;
         if chars.next_if_eq(&c).is_some() {
             *set = *set | 1;
@@ -307,19 +344,35 @@ fn steno_keys_to_sounds(keys: &EnumSet<StenoKey>) -> Vec<Sound> {
         ret.push(Sound::R);
     }
 
+    // NOTE(vipa, 2025-02-07): Added, may or may not be a good idea
+    if remove_compound_sound(&mut keys, A | RR) {
+        ret.push(Sound::ER);
+    } else if remove_compound_sound(&mut keys, O | RR) {
+        ret.push(Sound::ER);
+    } else if remove_compound_sound(&mut keys, E | RR) {
+        ret.push(Sound::ER);
+    } else if remove_compound_sound(&mut keys, U | RR) {
+        ret.push(Sound::ER);
+    }
+
     // NOTE(vipa, 2025-02-04): Vowels
-    let s = match (keys.contains(A), keys.contains(O), keys.contains(E), keys.contains(U)) {
+    let s = match (
+        keys.contains(A),
+        keys.contains(O),
+        keys.contains(E),
+        keys.contains(U),
+    ) {
         (false, false, true, true) => Some(Sound::IH), // short i
         (false, true, false, true) => Some(Sound::OW), // ow, (boat)
         (false, true, true, false) => Some(Sound::AO), // o with a hat, (door)
-        (false, true, true, true) => Some(Sound::OY), // oi, (boy)
+        (false, true, true, true) => Some(Sound::OY),  // oi, (boy)
         (true, false, false, true) => Some(Sound::AW), // aw,
         (true, false, true, false) => Some(Sound::AE), // spelling?
-        (true, false, true, true) => Some(Sound::EY), // a with a hat, (clay)
+        (true, false, true, true) => Some(Sound::EY),  // a with a hat, (clay)
         (true, true, false, false) => Some(Sound::UW), // "oo" "oa", (dune)
-        (true, true, false, true) => Some(Sound::UW), // ew, (slew)
-        (true, true, true, false) => Some(Sound::IY), // e with a hat, (feel)
-        (true, true, true, true) => Some(Sound::AY), // long i
+        (true, true, false, true) => Some(Sound::UW),  // ew, (slew)
+        (true, true, true, false) => Some(Sound::IY),  // e with a hat, (feel)
+        (true, true, true, true) => Some(Sound::AY),   // long i
 
         (true, false, false, false) => Some(Sound::AH),
         (false, true, false, false) => Some(Sound::AA),
@@ -438,25 +491,69 @@ fn steno_keys_to_sounds(keys: &EnumSet<StenoKey>) -> Vec<Sound> {
 
 fn main() {
     match &env::args().collect::<Vec<_>>().as_slice() {
-        &[_, dict, ref words @ ..] => {
+        &[_, dict, ref chords @ ..] => {
             let file = File::open(dict).expect("Missing file probably");
             let entries = io::BufReader::new(file)
                 .lines()
                 .filter_map(|x| x.ok())
                 .filter(|x| !x.starts_with(";;;"))
                 .map(|x| WordEntry::from_line(&x).expect("Correct word entry"));
-            let chords : Vec<_> = words.iter()
-                .map(|x| parse_steno_chord(x).expect("Correct chord"))
-                .collect();
-            let sounds : Vec<_> = chords.iter()
-                .flat_map(|x| steno_keys_to_sounds(&x).into_iter())
-                .collect();
-            let matches : Vec<_> = entries
-                .filter(|x| x.sounds == sounds)
-                .map(|x| x.word)
-                .collect();
 
-            println!("{:?} {:?} {:?}", chords, sounds, matches)
+            let mut words_by_sounds: BTreeMap<_, Vec<_>> = BTreeMap::new();
+            for e in entries {
+                words_by_sounds.entry(e.sounds).or_default().push(e.word);
+            }
+
+            let mut entries = TrieBuilder::new();
+            let mut words = vec![];
+            words.reserve_exact(words_by_sounds.len());
+            for (idx, (sound_seq, w)) in words_by_sounds.into_iter().enumerate() {
+                entries.push(sound_seq, idx);
+                words.push(w);
+            }
+            let entries = entries.build();
+
+            let chords = chords
+                .iter()
+                .map(|x| parse_steno_chord(x).expect("Correct chord"))
+                .map(|x| steno_keys_to_sounds(&x));
+
+            // TODO(vipa, 2025-02-06): Use this stuff
+            // entries.inc_search();
+            let mut state = vec![(vec![], entries.inc_search())];
+            let mut next_state = vec![];
+
+            let before = std::time::Instant::now();
+            for chord in chords {
+                let next = state.drain(..).flat_map(|(mut words, mut search)| {
+                    search
+                        .query_until(&chord)
+                        .ok()
+                        .map(move |x| match x {
+                            Answer::Prefix => vec![(words, search)],
+                            Answer::Match => {
+                                words.push(search.value().unwrap());
+                                vec![(words, search)]
+                            }
+                            Answer::PrefixAndMatch => {
+                                let words2 = words.clone();
+                                let search2 = search.clone();
+                                words.push(search.value().unwrap());
+                                search.reset();
+                                vec![(words, search), (words2, search2)]
+                            }
+                        })
+                        .into_iter()
+                        .flat_map(|x| x.into_iter())
+                });
+                next_state.extend(next);
+                mem::swap(&mut state, &mut next_state);
+            }
+            let after = std::time::Instant::now();
+
+            let results: Vec<(Vec<_>, _)> = state.iter().map(|(w, s)| (w.iter().map(|i| &words[**i]).collect(), s.prefix_len())).collect();
+
+            println!("{:?} {:?}", after - before, results)
         }
         _ => {
             println!("Need at least cmudict as an argument");

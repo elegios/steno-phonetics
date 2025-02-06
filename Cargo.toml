@@ -5,3 +5,4 @@ edition = "2021"
 
 [dependencies]
 enumset = "1.1.5"
+trie-rs = "0.4.2"
