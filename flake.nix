@@ -9,6 +9,8 @@
       shell = pkgs.mkShell {
         name = "dev shell";
         buildInputs = [
+          nixpkgs.legacyPackages.x86_64-linux.openssl
+          nixpkgs.legacyPackages.x86_64-linux.pkg-config
           nixpkgs.legacyPackages.x86_64-linux.cargo
           nixpkgs.legacyPackages.x86_64-linux.rust-analyzer
           nixpkgs.legacyPackages.x86_64-linux.rustc

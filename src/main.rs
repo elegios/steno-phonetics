@@ -1,5 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     env, fmt,
     fs::File,
     io::{self, BufRead},
@@ -498,20 +499,23 @@ struct FinishedBackLink<'a> {
 enum State<'a> {
     Finished {
         links: Vec<FinishedBackLink<'a>>,
+        id: u32,
     },
     Unfinished {
         prev: Rc<State<'a>>,
         search: IncSearch<'a, Sound, usize>,
+        id: u32,
     },
 }
 
 impl<'a> fmt::Debug for State<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Finished { links } => write!(f, "Finished {{links: {:?}}}", links),
-            Self::Unfinished { prev, search } => write!(
+            Self::Finished { links, id } => write!(f, "Finished {{id: {}, links: {:?}}}", id, links),
+            Self::Unfinished { prev, search, id } => write!(
                 f,
-                "Unfinished {{prev: {:?}, search: {}}}",
+                "Unfinished {{id: {}, prev: {:?}, search: {}}}",
+                id,
                 prev,
                 search.prefix_len()
             ),
@@ -520,8 +524,10 @@ impl<'a> fmt::Debug for State<'a> {
 }
 
 impl<'a> State<'a> {
-    fn new() -> State<'a> {
-        Self::Finished { links: vec![] }
+    fn new(ids: &mut u32) -> State<'a> {
+        let id = *ids;
+        *ids += 1;
+        Self::Finished { links: vec![], id }
     }
 
     fn step(
@@ -531,6 +537,7 @@ impl<'a> State<'a> {
         chord: &[Sound],
         finished: &mut Vec<FinishedBackLink<'a>>,
         unfinished: &mut Vec<Rc<Self>>,
+        ids: &mut u32,
     ) {
         let mut search = match &*self {
             Self::Finished { .. } => entries.inc_search(),
@@ -550,7 +557,13 @@ impl<'a> State<'a> {
         }
 
         if answer.is_prefix() {
-            unfinished.push(Rc::new(Self::Unfinished { search, prev: self }))
+            let id = *ids;
+            *ids += 1;
+            unfinished.push(Rc::new(Self::Unfinished {
+                search,
+                prev: self,
+                id,
+            }))
         }
     }
 
@@ -563,7 +576,7 @@ impl<'a> State<'a> {
 
     fn iter_partial_sentences(&self) -> Box<dyn Iterator<Item = Vec<&str>> + '_> {
         match self {
-            State::Finished { links } => {
+            State::Finished { links, .. } => {
                 if links.is_empty() {
                     Box::new(iter::once(vec![]))
                 } else {
@@ -581,6 +594,128 @@ impl<'a> State<'a> {
             State::Unfinished { prev, .. } => prev.iter_partial_sentences(),
         }
     }
+
+    const ABSENT_WEIGHT : f64 = 1e-20;
+
+    fn best_partial_sentence(
+        &self,
+        memo: &mut HashMap<u32, (f64, Vec<&'a str>)>,
+        weights: &HashMap<(&str, &str), f64>, // NOTE(vipa, 2025-02-09): log weights
+    ) -> u32 {
+        let id = match self {
+            Self::Finished { id, .. } => *id,
+            Self::Unfinished { id, .. } => *id,
+        };
+
+        let result = match self {
+            Self::Finished { links, .. } if links.is_empty() => (0.0, vec![]),
+            Self::Finished { links, .. } => {
+                let mut res = (f64::MIN, vec![]);
+                for l in links {
+                    let prev = l.prev.best_partial_sentence(memo, weights);
+                    let (prev_weight, sentence) = memo.get(&prev).unwrap();
+                    let mut sentence = sentence.clone();
+                    let prev_word : &str = sentence.last().map_or("_START_", |x| x);
+                    let (word, word_weight) = l.word_alternatives.iter()
+                        .map(|w| (w, weights.get(&(prev_word, w)).map_or(Self::ABSENT_WEIGHT, |x| *x)))
+                        .min_by(|l, r| l.1.total_cmp(&r.1))
+                        .expect("non-empty list");
+                    if prev_weight + word_weight > res.0 {
+                        sentence.push(word);
+                        res = (prev_weight + word_weight, sentence);
+                    }
+                }
+                res
+            }
+            State::Unfinished { prev, .. } => {
+                let prev = prev.best_partial_sentence(memo, weights);
+                memo.get(&prev).unwrap().to_owned()
+            },
+        };
+
+        memo.insert(id, result);
+        id
+    }
+
+    fn bigrams(self: &Rc<Self>) -> HashSet<(&str, &str)> {
+        let mut marked = HashMap::new();
+        let mut requested = HashSet::new();
+        self.explore(&mut marked, &mut requested);
+        return requested;
+    }
+
+    fn explore(
+        &self,
+        marked: &mut HashMap<u32, Vec<&'a str>>,
+        requested: &mut HashSet<(&'a str, &'a str)>,
+    ) -> u32 {
+        let id = match self {
+            Self::Finished { id, .. } => *id,
+            Self::Unfinished { id, .. } => *id,
+        };
+        if marked.contains_key(&id) {
+            return id;
+        }
+
+        let result = match self {
+            Self::Finished { links, .. } if links.is_empty() => vec!["_START_"],
+            Self::Finished { links, .. } => {
+                let mut ret = vec![];
+                for l in links {
+                    let prev = l.prev.explore(marked, requested);
+                    let prev = marked.get(&prev).unwrap();
+                    ret.extend(l.word_alternatives.iter().map(|x| x.as_str()));
+
+                    for p in prev {
+                        for w in l.word_alternatives {
+                            requested.insert((p, w));
+                        }
+                    }
+                }
+                ret
+            }
+            Self::Unfinished { prev, .. } => {
+                let prev = prev.explore(marked, requested).to_owned();
+                marked.get(&prev).unwrap().to_owned()
+            }
+        };
+
+        marked.insert(id, result);
+        id
+    }
+}
+
+#[derive(Serialize)]
+struct NGramRequest {
+    queries: Vec<String>
+}
+
+#[derive(Deserialize, Debug)]
+#[repr(transparent)]
+struct NGramToken {
+    text: String
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct NGram {
+    // id: String,
+    // abs_total_match_count : i64,
+    rel_total_match_count : f64,
+    tokens : Vec<NGramToken>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct NGramResult {
+    query_tokens : Vec<NGramToken>,
+    ngrams : Option<Vec<NGram>>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct NGramResponse {
+    results : Vec<NGramResult>
 }
 
 fn main() {
@@ -612,9 +747,8 @@ fn main() {
                 .map(|x| parse_steno_chord(x).expect("Correct chord"))
                 .map(|x| steno_keys_to_sounds(&x));
 
-            // TODO(vipa, 2025-02-06): Use this stuff
-            // entries.inc_search();
-            let mut state = vec![Rc::new(State::new())];
+            let mut node_ids = 0;
+            let mut state = vec![Rc::new(State::new(&mut node_ids))];
             let mut next_state = vec![];
 
             let before = std::time::Instant::now();
@@ -622,14 +756,59 @@ fn main() {
                 let mut finished = vec![];
                 println!("{:?}", chord);
                 for s in state.drain(..) {
-                    s.step(&entries, &words, &chord, &mut finished, &mut next_state)
+                    s.step(
+                        &entries,
+                        &words,
+                        &chord,
+                        &mut finished,
+                        &mut next_state,
+                        &mut node_ids,
+                    )
                 }
                 if !finished.is_empty() {
-                    next_state.push(Rc::new(State::Finished { links: finished }));
+                    let id = node_ids;
+                    node_ids += 1;
+                    next_state.push(Rc::new(State::Finished {
+                        links: finished,
+                        id,
+                    }));
                 }
                 mem::swap(&mut state, &mut next_state);
             }
             let after = std::time::Instant::now();
+
+            let finished = state.iter()
+                .find(|x| x.is_finished())
+                .expect("no valid sentence");
+
+            let original_bigrams : Vec<_> = finished.bigrams()
+                .into_iter()
+                .collect();
+            let bigrams = original_bigrams
+                .iter()
+                .map(|(w1, w2)| format!("{} {}", w1, w2))
+                .collect();
+
+            let client = reqwest::blocking::Client::new();
+            println!("{:?}", bigrams);
+            let result : NGramResponse = client.post("https://api.ngrams.dev/eng/batch?flags=cr")
+                .json(&NGramRequest {queries: bigrams})
+                .send()
+                .expect("Requesting ngram stuff works")
+                // .text()
+                // .expect("There's text");
+                .json()
+                .expect("Properly formatted json");
+            let mut weights = HashMap::new();
+            for (pair, result) in original_bigrams.into_iter().zip(result.results.into_iter()) {
+                if let Some(x) = result.ngrams.unwrap_or_default().first() {
+                    weights.insert(pair, x.rel_total_match_count.log2());
+                }
+            }
+            let mut memo = HashMap::new();
+
+            let sentence = finished.best_partial_sentence(&mut memo, &weights);
+            let (prob, sentence) = memo.get(&sentence).unwrap();
 
             let results: Vec<_> = state
                 .iter()
@@ -639,7 +818,7 @@ fn main() {
 
             println!("{:?}", after - before);
             // println!("{:?}", state);
-            println!("{:?}", results);
+            println!("{} {:?}", prob, sentence);
         }
         _ => {
             println!("Need at least cmudict as an argument");
