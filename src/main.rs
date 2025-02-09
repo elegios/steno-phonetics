@@ -54,7 +54,7 @@ enum Sound {
     W,
     Y,
     Z,
-    ZH,
+    // ZH, // NOTE(vipa, 2025-02-09): We make no distinction between ZH and SH
 }
 
 impl Sound {
@@ -144,7 +144,7 @@ impl Sound {
             "W" => Some(W),
             "Y" => Some(Y),
             "Z" => Some(Z),
-            "ZH" => Some(ZH),
+            "ZH" => Some(SH),
             _ => None,
         }
     }
