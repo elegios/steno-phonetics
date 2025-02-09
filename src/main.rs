@@ -1,15 +1,14 @@
-use enumset::enum_set;
-use std::collections::{BTreeMap, HashMap};
-use std::mem;
 use std::{
-    env,
+    collections::BTreeMap,
+    env, fmt,
     fs::File,
     io::{self, BufRead},
-    iter,
+    iter, mem,
     process::exit,
+    rc::Rc,
 };
 use trie_rs::{
-    inc_search::Answer,
+    inc_search::IncSearch,
     map::{Trie, TrieBuilder},
 };
 
@@ -489,6 +488,100 @@ fn steno_keys_to_sounds(keys: &EnumSet<StenoKey>) -> Vec<Sound> {
     ret
 }
 
+#[derive(Debug)]
+struct FinishedBackLink<'a> {
+    prev: Rc<State<'a>>,
+    word_alternatives: &'a [String],
+}
+
+enum State<'a> {
+    Finished {
+        links: Vec<FinishedBackLink<'a>>,
+    },
+    Unfinished {
+        prev: Rc<State<'a>>,
+        search: IncSearch<'a, Sound, usize>,
+    },
+}
+
+impl<'a> fmt::Debug for State<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Finished { links } => write!(f, "Finished {{links: {:?}}}", links),
+            Self::Unfinished { prev, search } => write!(
+                f,
+                "Unfinished {{prev: {:?}, search: {}}}",
+                prev,
+                search.prefix_len()
+            ),
+        }
+    }
+}
+
+impl<'a> State<'a> {
+    fn new() -> State<'a> {
+        Self::Finished { links: vec![] }
+    }
+
+    fn step(
+        self: Rc<Self>,
+        entries: &'a Trie<Sound, usize>,
+        words: &'a Vec<Vec<String>>,
+        chord: &[Sound],
+        finished: &mut Vec<FinishedBackLink<'a>>,
+        unfinished: &mut Vec<Rc<Self>>,
+    ) {
+        let mut search = match &*self {
+            Self::Finished { .. } => entries.inc_search(),
+            Self::Unfinished { search, .. } => search.clone(),
+        };
+
+        let answer = match search.query_until(chord) {
+            Err(_) => return,
+            Ok(answer) => answer,
+        };
+
+        if answer.is_match() {
+            finished.push(FinishedBackLink {
+                word_alternatives: &words[*search.value().unwrap()],
+                prev: self.clone(),
+            })
+        }
+
+        if answer.is_prefix() {
+            unfinished.push(Rc::new(Self::Unfinished { search, prev: self }))
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Finished { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn iter_partial_sentences(&self) -> Box<dyn Iterator<Item = Vec<&str>> + '_> {
+        match self {
+            State::Finished { links } => {
+                if links.is_empty() {
+                    Box::new(iter::once(vec![]))
+                } else {
+                    let it = links.iter().flat_map(|x| {
+                        x.word_alternatives.iter().flat_map(|w| {
+                            x.prev.iter_partial_sentences().map(|mut sentence| {
+                                sentence.push(w);
+                                sentence
+                            })
+                        })
+                    });
+                    Box::new(it)
+                }
+            }
+            State::Unfinished { prev, .. } => prev.iter_partial_sentences(),
+        }
+    }
+}
+
 fn main() {
     match &env::args().collect::<Vec<_>>().as_slice() {
         &[_, dict, ref chords @ ..] => {
@@ -520,40 +613,32 @@ fn main() {
 
             // TODO(vipa, 2025-02-06): Use this stuff
             // entries.inc_search();
-            let mut state = vec![(vec![], entries.inc_search())];
+            let mut state = vec![Rc::new(State::new())];
             let mut next_state = vec![];
 
             let before = std::time::Instant::now();
             for chord in chords {
-                let next = state.drain(..).flat_map(|(mut words, mut search)| {
-                    search
-                        .query_until(&chord)
-                        .ok()
-                        .map(move |x| match x {
-                            Answer::Prefix => vec![(words, search)],
-                            Answer::Match => {
-                                words.push(search.value().unwrap());
-                                vec![(words, search)]
-                            }
-                            Answer::PrefixAndMatch => {
-                                let words2 = words.clone();
-                                let search2 = search.clone();
-                                words.push(search.value().unwrap());
-                                search.reset();
-                                vec![(words, search), (words2, search2)]
-                            }
-                        })
-                        .into_iter()
-                        .flat_map(|x| x.into_iter())
-                });
-                next_state.extend(next);
+                let mut finished = vec![];
+                println!("{:?}", chord);
+                for s in state.drain(..) {
+                    s.step(&entries, &words, &chord, &mut finished, &mut next_state)
+                }
+                if !finished.is_empty() {
+                    next_state.push(Rc::new(State::Finished { links: finished }));
+                }
                 mem::swap(&mut state, &mut next_state);
             }
             let after = std::time::Instant::now();
 
-            let results: Vec<(Vec<_>, _)> = state.iter().map(|(w, s)| (w.iter().map(|i| &words[**i]).collect(), s.prefix_len())).collect();
+            let results: Vec<_> = state
+                .iter()
+                .filter(|x| State::is_finished(x))
+                .flat_map(|x| State::iter_partial_sentences(x))
+                .collect();
 
-            println!("{:?} {:?}", after - before, results)
+            println!("{:?}", after - before);
+            // println!("{:?}", state);
+            println!("{:?}", results);
         }
         _ => {
             println!("Need at least cmudict as an argument");
