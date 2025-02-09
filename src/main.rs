@@ -25,7 +25,7 @@ enum Sound {
     B,
     CH,
     D,
-    DH,
+    // DH, // NOTE(vipa, 2025-02-09): We make no distinction between DH and TH
     EH,
     ER,
     EY,
@@ -88,7 +88,7 @@ impl Sound {
             "B" => Some(B),
             "CH" => Some(CH),
             "D" => Some(D),
-            "DH" => Some(DH),
+            "DH" => Some(TH),
             "EH" => Some(EH),
             "EH0" => Some(EH),
             "EH1" => Some(EH),
@@ -284,7 +284,8 @@ fn steno_keys_to_sounds(keys: &EnumSet<StenoKey>) -> Vec<Sound> {
     if remove_compound_sound(&mut keys, LT | LH) {
         ret.push(Sound::TH);
     }
-    if remove_compound_sound(&mut keys, LT | LP | LH) {
+    if !keys.contains(LR) && remove_compound_sound(&mut keys, LT | LP | LH) {
+        // NOTE(vipa, 2025-02-09): We prioritize F L over N R
         ret.push(Sound::N);
     }
     if remove_compound_sound(&mut keys, LT | LH) {
@@ -407,7 +408,7 @@ fn steno_keys_to_sounds(keys: &EnumSet<StenoKey>) -> Vec<Sound> {
         ret.push(Sound::V);
     }
     if remove_compound_sound(&mut keys, RF | RR | RP | RB) {
-        ret.push(Sound::R); // NOTE(vipa, 2025-02-04): Should also be NCH
+        ret.push(Sound::R); // TODO(vipa, 2025-02-04): Should also be NCH
         ret.push(Sound::CH);
     }
     if remove_compound_sound(&mut keys, RF | RP) {
