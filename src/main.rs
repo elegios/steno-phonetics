@@ -161,6 +161,7 @@ impl WordEntry {
     fn from_line(line: &str) -> Result<WordEntry, String> {
         let mut iter = line.split_ascii_whitespace();
         if let Some(word) = iter.next() {
+            let word = word.trim_end_matches("(1)").trim_end_matches("(2)");
             return Result::Ok(WordEntry {
                 word: word.to_string(),
                 sounds: iter
@@ -595,7 +596,7 @@ impl<'a> State<'a> {
         }
     }
 
-    const ABSENT_WEIGHT : f64 = 1e-20;
+    const ABSENT_WEIGHT : f64 = -140.0;   // NOTE(vipa, 2025-02-12): In log2 space
 
     fn best_partial_sentence(
         &self,
@@ -618,7 +619,7 @@ impl<'a> State<'a> {
                     let prev_word : &str = sentence.last().map_or("_START_", |x| x);
                     let (word, word_weight) = l.word_alternatives.iter()
                         .map(|w| (w, weights.get(&(prev_word, w)).map_or(Self::ABSENT_WEIGHT, |x| *x)))
-                        .min_by(|l, r| l.1.total_cmp(&r.1))
+                        .max_by(|l, r| l.1.total_cmp(&r.1))
                         .expect("non-empty list");
                     if prev_weight + word_weight > res.0 {
                         sentence.push(word);
@@ -818,6 +819,7 @@ fn main() {
 
             println!("{:?}", after - before);
             // println!("{:?}", state);
+            println!("{:?}", weights);
             println!("{} {:?}", prob, sentence);
         }
         _ => {
