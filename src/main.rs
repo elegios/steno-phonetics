@@ -1,7 +1,9 @@
+use bitvec::{order::Msb0, view::BitView};
 use color_eyre::{
     eyre::{eyre, Context, OptionExt},
     Result,
 };
+use enumset::{enum_set, EnumSet, EnumSetType};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,14 +14,16 @@ use std::{
     io::{self, BufRead},
     iter,
     num::NonZero,
-    process::exit,
 };
+use tokio::{
+    io::AsyncReadExt,
+    sync::mpsc::{self, Receiver, Sender},
+};
+use tokio_serial::SerialPortBuilderExt;
 use trie_rs::{
     inc_search::IncSearch,
     map::{Trie, TrieBuilder},
 };
-
-use enumset::{EnumSet, EnumSetType};
 
 #[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Copy)]
 enum Sound {
@@ -266,6 +270,87 @@ fn parse_steno_chord(chord: &str) -> Result<EnumSet<StenoKey>> {
     }
 }
 
+fn bytes_to_steno_chord(bytes: &[u8; BYTES_PER_STROKE]) -> Result<EnumSet<StenoKey>> {
+    use StenoKey::*;
+    const KEYS: [[EnumSet<StenoKey>; 7]; BYTES_PER_STROKE] = [
+        [
+            enum_set!(),
+            enum_set!(), /* left number */
+            enum_set!(), /* right number */
+            enum_set!(),
+            enum_set!(),
+            enum_set!(),
+            enum_set!(),
+        ],
+        [
+            enum_set!(LS),
+            enum_set!(LS),
+            enum_set!(LT),
+            enum_set!(LK),
+            enum_set!(LP),
+            enum_set!(LW),
+            enum_set!(LH),
+        ],
+        [
+            enum_set!(LR),
+            enum_set!(A),
+            enum_set!(O),
+            enum_set!(Star),
+            enum_set!(Star),
+            enum_set!(),
+            enum_set!(),
+        ],
+        [
+            enum_set!(),
+            enum_set!(Star),
+            enum_set!(Star),
+            enum_set!(E),
+            enum_set!(U),
+            enum_set!(RF),
+            enum_set!(RR),
+        ],
+        [
+            enum_set!(RP),
+            enum_set!(RB),
+            enum_set!(RL),
+            enum_set!(RG),
+            enum_set!(RT),
+            enum_set!(RS),
+            enum_set!(RD),
+        ],
+        [
+            enum_set!(),
+            enum_set!(),
+            enum_set!(),
+            enum_set!(),
+            enum_set!(),
+            enum_set!(),
+            enum_set!(RZ),
+        ],
+    ];
+
+    if !bytes[0].view_bits::<Msb0>()[0] {
+        return Err(eyre!("Bad first bit in steno chord: {:?}", bytes));
+    }
+    for b in &bytes[1..] {
+        if b.view_bits::<Msb0>()[0] {
+            return Err(eyre!("Bad follow bit in steno chord: {:?}", bytes));
+        }
+    }
+    Ok(bytes
+        .iter()
+        .zip(KEYS.iter())
+        .flat_map(|(bits, keys)| {
+            bits.view_bits::<Msb0>()[1..]
+                .iter()
+                .by_vals()
+                .zip(keys.iter())
+        })
+        .filter(|(bit, _)| *bit)
+        .map(|(_, x)| *x)
+        .collect())
+}
+
 fn steno_keys_to_sounds(keys: EnumSet<StenoKey>) -> Vec<Sound> {
     use StenoKey::*;
     // NOTE(vipa, 2025-02-04): Assumption: "compound sounds" will only
@@ -329,7 +414,8 @@ fn steno_keys_to_sounds(keys: EnumSet<StenoKey>) -> Vec<Sound> {
     }
 
     // NOTE(vipa, 2025-02-04): LP
-    if remove_compound_sound(&mut keys, LP | LH) {
+    if !keys.contains(LR) && remove_compound_sound(&mut keys, LP | LH) {
+        // NOTE(vipa, 2025-02-15): We prioritize P L over M R
         ret.push(Sound::M);
     }
     if remove_compound_sound(&mut keys, LP | LW) {
@@ -549,16 +635,47 @@ impl<'a> State<'a> {
         }
     }
 
-    fn likeliest_sentence(&self) -> (f64, Vec<&'a str>) {
+    fn print_interactive_state(&self) -> Result<()> {
+        let (idx, sentence) = (0..=(self.finished.len() - 1))
+            .rev()
+            .find_map(|idx| self.likeliest_sentence_at(idx).map(|x| (idx, x)))
+            .unwrap_or((0, vec![]));
+
+        for w in sentence {
+            print!("{} ", w);
+        }
+
+        let extra_chords = self.finished.len() - 1 - idx;
+        if extra_chords > 0 {
+            print!("+ {}", extra_chords);
+            let first_dead_idx = (0..=(self.finished.len() - 1))
+                .rev()
+                .take_while(|idx| {
+                    self.finished[*idx].is_empty() && self.unfinished[*idx].is_empty()
+                })
+                .last();
+            if first_dead_idx.is_some() {
+                print!(" (dead)")
+            }
+        }
+
+        println!("");
+
+        Ok(())
+    }
+
+    fn likeliest_sentence_at(&self, idx: usize) -> Option<Vec<&'a str>> {
         let mut result = vec![];
         let mut thing = self
             .finished
-            .last()
+            .get(idx)
             .iter()
             .flat_map(|x| x.iter())
             .max_by(|l, r| l.weight.total_cmp(&r.weight));
 
-        let prob = thing.map_or(f64::MIN, |x| x.weight);
+        if thing.is_none() {
+            return None;
+        }
 
         while let Some(t) = thing {
             result.push(t.word);
@@ -568,7 +685,11 @@ impl<'a> State<'a> {
         }
         result.reverse();
 
-        (prob, result)
+        Some(result)
+    }
+
+    fn likeliest_sentence(&self) -> Option<Vec<&'a str>> {
+        self.likeliest_sentence_at(self.finished.len() - 1)
     }
 
     const ABSENT_WEIGHT: f64 = -140.0; // NOTE(vipa, 2025-02-12): In log2 space
@@ -596,20 +717,21 @@ impl<'a> State<'a> {
             .flat_map(|p| Self::iter_prev_words_state(p, finished))
     }
 
-    fn step<F>(
+    fn pop_last(&mut self) {
+        if self.unfinished.len() > 1 {
+            self.unfinished.pop();
+            self.finished.pop();
+        }
+    }
+
+    async fn step(
         &mut self,
         trie: &'a Trie<Sound, usize>,
         words: &'a Vec<Vec<String>>,
         chord: &[Sound],
         weights: &mut LruCache<(&'a str, &'a str), f64>,
-        fetch_weights: F,
-    ) -> Result<()>
-    where
-        F: FnOnce(
-            &mut LruCache<(&'a str, &'a str), f64>,
-            HashSet<(&'a str, &'a str)>,
-        ) -> Result<()>,
-    {
+        client: &reqwest::Client,
+    ) -> Result<()> {
         let mut next_unfinished = vec![];
         let mut to_finish: HashMap<&'a str, Vec<Option<StateIdx>>> = HashMap::new();
 
@@ -678,7 +800,7 @@ impl<'a> State<'a> {
             });
         bigrams.retain(|x| !weights.contains(x));
 
-        fetch_weights(weights, bigrams)?;
+        fetch_weights(client, weights, bigrams).await?;
 
         let mut next_finished = vec![];
         for (word, prevs) in to_finish.into_iter() {
@@ -734,8 +856,8 @@ struct NGramResponse {
     results: Vec<NGramResult>,
 }
 
-fn fetch_weights<'a>(
-    client: &reqwest::blocking::Client,
+async fn fetch_weights<'a>(
+    client: &reqwest::Client,
     weights: &mut LruCache<(&'a str, &'a str), f64>,
     bigrams: HashSet<(&'a str, &'a str)>,
 ) -> Result<()> {
@@ -749,8 +871,10 @@ fn fetch_weights<'a>(
         .post("https://api.ngrams.dev/eng/batch?flags=cr")
         .json(&NGramRequest { queries: bigrams })
         .send()
+        .await
         .context("NGram request")?
         .json()
+        .await
         .context("NGram json parse")?;
 
     let iter = original_bigrams.into_iter().zip(result.results.into_iter());
@@ -762,64 +886,131 @@ fn fetch_weights<'a>(
     Ok(())
 }
 
-fn main() -> Result<()> {
-    color_eyre::install()?;
+fn parse_dict_file(path: &str) -> Result<(Trie<Sound, usize>, Vec<Vec<String>>)> {
+    let file = File::open(path).context("Dictionary file")?;
+    let entries = io::BufReader::new(file)
+        .lines()
+        .filter_map(|x| x.ok())
+        .filter(|x| !x.starts_with(";;;"))
+        .map(|x| WordEntry::from_line(&x));
 
-    match &env::args().collect::<Vec<_>>().as_slice() {
-        &[_, dict, ref chords @ ..] => {
-            let file = File::open(dict).context("Dictionary file")?;
-            let entries = io::BufReader::new(file)
-                .lines()
-                .filter_map(|x| x.ok())
-                .filter(|x| !x.starts_with(";;;"))
-                .map(|x| WordEntry::from_line(&x));
+    let mut words_by_sounds: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for e in entries {
+        let e = e?;
+        words_by_sounds.entry(e.sounds).or_default().push(e.word);
+    }
 
-            let mut words_by_sounds: BTreeMap<_, Vec<_>> = BTreeMap::new();
-            for e in entries {
-                let e = e?;
-                words_by_sounds.entry(e.sounds).or_default().push(e.word);
+    let mut entries = TrieBuilder::new();
+    let mut words = vec![];
+    words.reserve_exact(words_by_sounds.len());
+    for (idx, (sound_seq, w)) in words_by_sounds.into_iter().enumerate() {
+        entries.push(sound_seq, idx);
+        words.push(w);
+    }
+    let entries = entries.build();
+    Ok((entries, words))
+}
+
+async fn run<'a>(
+    trie: Trie<Sound, usize>,
+    words: Vec<Vec<String>>,
+    mut tx: Receiver<EnumSet<StenoKey>>, // mut terminal: DefaultTerminal,
+) -> Result<Vec<String>> {
+    let mut state = State::new(&trie);
+    let client = reqwest::Client::new();
+    let mut weights = LruCache::new(NonZero::new(10000).unwrap());
+
+    loop {
+        state.print_interactive_state()?;
+        if let Some(chord) = tx.recv().await {
+            if chord == StenoKey::Star {
+                state.pop_last();
+            } else {
+                let chord = steno_keys_to_sounds(chord);
+                state
+                    .step(&trie, &words, &chord, &mut weights, &client)
+                    .await?
             }
-
-            let mut entries = TrieBuilder::new();
-            let mut words = vec![];
-            words.reserve_exact(words_by_sounds.len());
-            for (idx, (sound_seq, w)) in words_by_sounds.into_iter().enumerate() {
-                entries.push(sound_seq, idx);
-                words.push(w);
-            }
-            let entries = entries.build();
-
-            let chords = chords
-                .iter()
-                .map(|x| parse_steno_chord(x).map(steno_keys_to_sounds));
-
-            let mut state = State::new(&entries);
-
-            let client = reqwest::blocking::Client::new();
-
-            let mut weights = LruCache::new(NonZero::new(10000).unwrap());
-
-            let before = std::time::Instant::now();
-            for chord in chords {
-                println!("{:?}", chord);
-                let chord = chord?;
-                state.step(&entries, &words, &chord, &mut weights, |a, b| {
-                    fetch_weights(&client, a, b)
-                })?;
-            }
-            let after = std::time::Instant::now();
-
-            let (prob, sentence) = state.likeliest_sentence();
-
-            println!("{:?}", after - before);
-            // println!("{:?}", state);
-            println!("{:?}", weights);
-            println!("{} {:?}", prob, sentence);
-            Ok(())
-        }
-        _ => {
-            println!("Need at least cmudict as an argument");
-            exit(1);
+        } else {
+            return state
+                .likeliest_sentence()
+                .map(|x| x.iter().map(|x| x.to_string()).collect())
+                .ok_or_eyre("No valid sentence");
         }
     }
+}
+
+const BYTES_PER_STROKE: usize = 6;
+
+async fn read_steno_machine<T>(path: &str, tx: Sender<EnumSet<StenoKey>>) -> Result<T> {
+    let mut port = tokio_serial::new(path, 9600).open_native_async()?;
+    let mut buffer = [0u8; BYTES_PER_STROKE];
+
+    loop {
+        port.read_exact(&mut buffer).await?;
+        let res = bytes_to_steno_chord(&buffer)?;
+        tx.send(res).await?;
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    color_eyre::install()?;
+    let dict_path = env::args()
+        .take(2)
+        .last()
+        .ok_or_eyre("Need one argument: the path to the phonetic dictionary")?;
+
+    let (trie, words) = parse_dict_file(&dict_path)?;
+
+    // let terminal = ratatui::init();
+    // let res = run(&trie, &words, terminal);
+    // ratatui::restore();
+    // res
+
+    let (send, recv) = mpsc::channel(5);
+
+    let mut set = tokio::task::JoinSet::new();
+    set.spawn(read_steno_machine("/dev/ttyACM0", send));
+    set.spawn(run(trie, words, recv));
+
+    let res = set.join_next().await.expect("Known non-empty set");
+    set.shutdown().await;
+
+    let final_sentence = res??;
+
+    println!("{:?}", final_sentence);
+
+    Ok(())
+
+    // match &env::args().collect::<Vec<_>>().as_slice() {
+    //     &[_, dict, ref chords @ ..] => {
+
+    //         let chords = chords
+    //             .iter()
+    //             .map(|x| parse_steno_chord(x).map(steno_keys_to_sounds));
+
+    //         let before = std::time::Instant::now();
+    //         for chord in chords {
+    //             println!("{:?}", chord);
+    //             let chord = chord?;
+    //             state.step(&entries, &words, &chord, &mut weights, |a, b| {
+    //                 fetch_weights(&client, a, b)
+    //             })?;
+    //         }
+    //         let after = std::time::Instant::now();
+
+    //         let (prob, sentence) = state.likeliest_sentence();
+
+    //         println!("{:?}", after - before);
+    //         // println!("{:?}", state);
+    //         println!("{:?}", weights);
+    //         println!("{} {:?}", prob, sentence);
+    //         Ok(())
+    //     }
+    //     _ => {
+    //         println!("Need at least cmudict as an argument");
+    //         exit(1);
+    //     }
+    // }
 }

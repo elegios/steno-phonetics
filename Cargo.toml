@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bitvec = "1.0.1"
 color-eyre = "0.6.3"
 either = "1.13.0"
 enumset = "1.1.5"
 lru = "0.13.0"
 reqwest = { version = "0.12.12", features = ["blocking", "json"] }
 serde = { version = "1.0.217", features = ["derive"] }
+tokio = { version = "1.43.0", features = ["full"] }
+tokio-serial = "5.4.5"
 trie-rs = "0.4.2"
 
 [profile.dev.package.backtrace]
